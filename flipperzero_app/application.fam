@@ -1,0 +1,8 @@
+App(
+    appid="flippflop",
+    name="Flippflop",
+    apptype="FlipperApplication",
+    entry_point="flippflop_app",
+    stack_size=2 * 1024,
+    order=100,
+)
