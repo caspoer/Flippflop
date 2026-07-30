@@ -1,3 +1,4 @@
+#include <WiFi.h>
 #include <WebServer.h>
 #include <SPI.h>
 
@@ -6,12 +7,21 @@ const char* AP_PASSWORD = "88888888";
 
 constexpr uint8_t LED_PIN = 8;
 constexpr uint8_t SPI_SCK = 4;
-constexpr uint8_#include <WiFi.h>t SPI_MOSI = 6;
+constexpr uint8_t SPI_MOSI = 6;
 constexpr uint8_t SPI_MISO = 5;
 constexpr uint8_t CC1101_CS = 7;
 constexpr uint8_t CC1101_GDO0 = 10;
 constexpr float MIN_FREQUENCY_MHZ = 300.0f;
 constexpr float MAX_FREQUENCY_MHZ = 6000.0f;
+
+constexpr uint8_t CC1101_REG_PARTNUM = 0x30;
+constexpr uint8_t CC1101_REG_FREQ0 = 0x0D;
+constexpr uint8_t CC1101_REG_FREQ1 = 0x0E;
+constexpr uint8_t CC1101_REG_FREQ2 = 0x0F;
+constexpr uint8_t CC1101_READ_FLAG = 0x80;
+constexpr uint16_t MAX_SWEEP_ITERATIONS = 10000;
+constexpr float MIN_SWEEP_STEP = 0.01f;
+constexpr bool ENABLE_WIFI = true;
 
 WebServer server(80);
 
@@ -36,6 +46,117 @@ struct Cc1101State {
 
 Cc1101State radio;
 
+void processSerialCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  
+  int colonIndex = command.indexOf(':');
+  String cmd = (colonIndex > 0) ? command.substring(0, colonIndex) : command;
+  String args = (colonIndex > 0) ? command.substring(colonIndex + 1) : "";
+  
+  Serial.print("> ");
+  Serial.println(cmd);
+  
+  if (cmd == "INIT") {
+    bool ok = cc1101Init();
+    Serial.println(ok ? "OK:CC1101_INITIALIZED" : "ERROR:CC1101_NOT_DETECTED");
+  }
+  else if (cmd == "TUNE") {
+    float freq = args.toFloat();
+    if (freq < MIN_FREQUENCY_MHZ || freq > MAX_FREQUENCY_MHZ) {
+      Serial.print("ERROR:FREQUENCY_OUT_OF_RANGE:");
+      Serial.print(MIN_FREQUENCY_MHZ);
+      Serial.print("-");
+      Serial.println(MAX_FREQUENCY_MHZ);
+    } else {
+      cc1101SetFrequency(freq);
+      Serial.print("OK:TUNED:");
+      Serial.println(freq);
+    }
+  }
+  else if (cmd == "SEND") {
+    cc1101SendPing();
+    Serial.println("OK:PING_SENT");
+  }
+  else if (cmd == "READ") {
+    cc1101ReadPacket();
+    Serial.println("OK:PACKET_READ");
+  }
+  else if (cmd == "RSSI") {
+    int8_t rssi = cc1101ReadRssi();
+    Serial.print("OK:RSSI:");
+    Serial.println(rssi);
+  }
+  else if (cmd == "SWEEP") {
+    cc1101SweepFrequencies();
+    Serial.print("OK:SWEEP_BEST:");
+    Serial.print(radio.sweepBestMHz);
+    Serial.print(":");
+    Serial.println(radio.sweepBestRssi);
+  }
+  else if (cmd == "CARRIER") {
+    if (args == "ON") {
+      cc1101StartCarrier();
+      Serial.println("OK:CARRIER_ON");
+    } else if (args == "OFF") {
+      cc1101StopCarrier();
+      Serial.println("OK:CARRIER_OFF");
+    } else {
+      Serial.println("ERROR:INVALID_CARRIER_STATE");
+    }
+  }
+  else if (cmd == "JAM") {
+    uint16_t count = args.toInt();
+    if (count < 1 || count > 20) count = 5;
+    cc1101JamSignal(count);
+    Serial.print("OK:JAM_SENT:");
+    Serial.println(count);
+  }
+  else if (cmd == "MONITOR") {
+    if (args == "ON") {
+      radio.monitorMode = true;
+      Serial.println("OK:MONITOR_ON");
+    } else if (args == "OFF") {
+      radio.monitorMode = false;
+      Serial.println("OK:MONITOR_OFF");
+    } else {
+      Serial.println("ERROR:INVALID_MONITOR_STATE");
+    }
+  }
+  else if (cmd == "STATUS") {
+    Serial.print("PRESENT:");
+    Serial.print(radio.present ? "YES" : "NO");
+    Serial.print("|FREQ:");
+    Serial.print(radio.frequencyMHz);
+    Serial.print("|RSSI:");
+    Serial.print(radio.rssi);
+    Serial.print("|RX:");
+    Serial.print(radio.packetsReceived);
+    Serial.print("|TX:");
+    Serial.print(radio.packetsTransmitted);
+    Serial.print("|LAST:");
+    Serial.println(radio.lastPacket);
+  }
+  else if (cmd == "HELP") {
+    Serial.println("=== Flippflop Serial Commands ===");
+    Serial.println("INIT - Initialize CC1101");
+    Serial.println("TUNE:freq - Tune to frequency (MHz)");
+    Serial.println("SEND - Send ping packet");
+    Serial.println("READ - Read packet");
+    Serial.println("RSSI - Read signal strength");
+    Serial.println("SWEEP - Sweep band and find best signal");
+    Serial.println("CARRIER:ON|OFF - Enable/disable carrier");
+    Serial.println("JAM:count - Send jam signal (1-20)");
+    Serial.println("MONITOR:ON|OFF - Enable/disable monitor mode");
+    Serial.println("STATUS - Display current status");
+    Serial.println("HELP - Show this help message");
+  }
+  else {
+    Serial.println("ERROR:UNKNOWN_COMMAND");
+    Serial.println("Type HELP for command list");
+  }
+}
+
 void cc1101WriteRegister(uint8_t reg, uint8_t value) {
   digitalWrite(CC1101_CS, LOW);
   SPI.transfer(reg);
@@ -45,7 +166,7 @@ void cc1101WriteRegister(uint8_t reg, uint8_t value) {
 
 uint8_t cc1101ReadRegister(uint8_t reg) {
   digitalWrite(CC1101_CS, LOW);
-  SPI.transfer(0x80 | reg);
+  SPI.transfer(CC1101_READ_FLAG | reg);
   uint8_t value = SPI.transfer(0x00);
   digitalWrite(CC1101_CS, HIGH);
   return value;
@@ -55,22 +176,23 @@ bool cc1101Init() {
   pinMode(CC1101_CS, OUTPUT);
   pinMode(CC1101_GDO0, INPUT);
   digitalWrite(CC1101_CS, HIGH);
-
+  
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, CC1101_CS);
   delay(20);
-
-  uint8_t partNumber = cc1101ReadRegister(0x30);
+  
+  uint8_t partNumber = cc1101ReadRegister(CC1101_REG_PARTNUM);
   radio.present = (partNumber != 0xFF);
-
+  
   if (radio.present) {
-    cc1101WriteRegister(0x0D, 0x06);
-    cc1101WriteRegister(0x0E, 0x00);
-    cc1101WriteRegister(0x0F, 0x00);
+    cc1101WriteRegister(CC1101_REG_FREQ0, 0x06);
+    cc1101WriteRegister(CC1101_REG_FREQ1, 0x00);
+    cc1101WriteRegister(CC1101_REG_FREQ2, 0x00);
     radio.rssi = -55;
     strncpy(radio.lastPacket, "ready", sizeof(radio.lastPacket) - 1);
+    radio.lastPacket[sizeof(radio.lastPacket) - 1] = '\0';
     return true;
   }
-
+  
   return false;
 }
 
@@ -86,7 +208,7 @@ int8_t cc1101ReadRssi() {
   if (!radio.present) {
     return -128;
   }
-
+  
   radio.rssi = (int8_t)(-55 - (random(0, 20)));
   return radio.rssi;
 }
@@ -95,7 +217,7 @@ void cc1101SendPing() {
   if (!radio.present) {
     return;
   }
-
+  
   radio.packetsTransmitted += 1;
   radio.rssi = -42;
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "TX %.2f MHz", radio.frequencyMHz);
@@ -105,7 +227,7 @@ void cc1101SendPayload(const String& payload) {
   if (!radio.present) {
     return;
   }
-
+  
   radio.packetsTransmitted += 1;
   radio.rssi = -44;
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "msg:%s", payload.c_str());
@@ -115,7 +237,7 @@ void cc1101ReadPacket() {
   if (!radio.present) {
     return;
   }
-
+  
   radio.packetsReceived += 1;
   radio.rssi = -58;
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "RX %.2f MHz", radio.frequencyMHz);
@@ -135,18 +257,18 @@ void cc1101JamSignal(uint16_t count) {
   if (!radio.present || count == 0) {
     return;
   }
-
+  
   radio.jamActive = true;
   radio.jamCount = count;
   radio.jamSent = 0;
-
+  
   for (uint16_t i = 0; i < count; ++i) {
     radio.packetsTransmitted += 1;
     radio.jamSent += 1;
     radio.rssi = -40;
     delay(15);
   }
-
+  
   radio.jamActive = false;
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "JAM %u @%.2f", count, radio.frequencyMHz);
 }
@@ -154,7 +276,22 @@ void cc1101JamSignal(uint16_t count) {
 void cc1101SweepFrequencies() {
   radio.sweepBestRssi = -128;
   radio.sweepBestMHz = 0.0f;
-
+  
+  if (radio.sweepStartMHz > radio.sweepStopMHz) {
+    snprintf(radio.lastPacket, sizeof(radio.lastPacket), "sweep ERROR: start > stop");
+    return;
+  }
+  
+  if (radio.sweepStepMHz < MIN_SWEEP_STEP) {
+    radio.sweepStepMHz = MIN_SWEEP_STEP;
+  }
+  
+  uint16_t estimatedIterations = (uint16_t)((radio.sweepStopMHz - radio.sweepStartMHz) / radio.sweepStepMHz) + 1;
+  if (estimatedIterations > MAX_SWEEP_ITERATIONS) {
+    snprintf(radio.lastPacket, sizeof(radio.lastPacket), "sweep ERROR: too many iterations");
+    return;
+  }
+  
   for (float freq = radio.sweepStartMHz; freq <= radio.sweepStopMHz; freq += radio.sweepStepMHz) {
     cc1101SetFrequency(freq);
     int8_t sampleRssi = cc1101ReadRssi();
@@ -164,7 +301,7 @@ void cc1101SweepFrequencies() {
     }
     delay(20);
   }
-
+  
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "sweep best %.2f", radio.sweepBestMHz);
 }
 
@@ -184,6 +321,7 @@ String buildHtml() {
     .blue { background: #2563eb; color: white; }
     .red { background: #dc2626; color: white; }
     .gray { background: #475569; color: white; }
+    input { padding: 8px; border-radius: 8px; border: 1px solid #64748b; color: #0f172a; }
   </style>
 </head>
 <body>
@@ -196,7 +334,7 @@ String buildHtml() {
   <div class="card">
     <h3>RF Controls</h3>
     <form action="/rf/tune/" method="get" style="margin-bottom: 8px;">
-      <input name="freq" type="number" step="0.01" min="300" max="6000" placeholder="Frequency MHz" style="width: 180px; padding: 8px; border-radius: 8px; border: 1px solid #64748b; color: #0f172a;" />
+      <input name="freq" type="number" step="0.01" min="300" max="6000" placeholder="Frequency MHz" style="width: 180px;" />
       <button type="submit" class="blue" style="padding: 8px 12px;">Tune</button>
     </form>
     <a href="/rf/tune/433.92"><button class="blue">Tune 433.92 MHz</button></a>
@@ -213,7 +351,7 @@ String buildHtml() {
     <a href="/rf/carrier/on"><button class="blue">Carrier ON</button></a>
     <a href="/rf/carrier/off"><button class="gray">Carrier OFF</button></a>
     <form action="/rf/jam" method="get" style="margin-top: 8px;">
-      <input name="count" type="number" min="1" max="20" value="5" style="width: 100px; padding: 8px; border-radius: 8px; border: 1px solid #64748b; color: #0f172a;" />
+      <input name="count" type="number" min="1" max="20" value="5" style="width: 100px;" />
       <button type="submit" class="red" style="padding: 8px 12px;">Jam Signal</button>
     </form>
   </div>
@@ -270,14 +408,14 @@ void handleTune() {
   if (freqValue.length() == 0) {
     freqValue = server.arg("freq");
   }
-
+  
   float freq = freqValue.toFloat();
   if (freq < MIN_FREQUENCY_MHZ || freq > MAX_FREQUENCY_MHZ) {
     String payload = "{\"ok\":false,\"error\":\"Frequency must be " + String(MIN_FREQUENCY_MHZ, 0) + "-" + String(MAX_FREQUENCY_MHZ, 0) + " MHz\"}";
     server.send(400, "application/json", payload);
     return;
   }
-
+  
   cc1101SetFrequency(freq);
   String payload = "{\"ok\":true,\"frequency\":" + String(freq, 2) + "}";
   server.send(200, "application/json", payload);
@@ -345,41 +483,70 @@ void handleJam() {
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
+  
+  Serial.println("\n\n==============================================");
+  Serial.println("       FLIPPFLOP - CC1101 Radio Controller");
+  Serial.println("==============================================");
+  
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-
+  
   bool radioOk = cc1101Init();
   if (radioOk) {
-    Serial.println("CC1101 ready");
+    Serial.println("[SUCCESS] CC1101 ready");
   } else {
-    Serial.println("CC1101 not detected");
+    Serial.println("[WARNING] CC1101 not detected");
   }
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  IPAddress ip = WiFi.softAPIP();
-
-  Serial.print("AP IP: ");
-  Serial.println(ip);
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/led/on", HTTP_GET, handleLedOn);
-  server.on("/led/off", HTTP_GET, handleLedOff);
-  server.on("/rf/tune/", HTTP_GET, handleTune);
-  server.on("/rf/send", HTTP_GET, handleSendPing);
-  server.on("/rf/read", HTTP_GET, handleReadPacket);
-  server.on("/rf/rssi", HTTP_GET, handleRssi);
-  server.on("/rf/sweep", HTTP_GET, handleSweep);
-  server.on("/rf/monitor/on", HTTP_GET, handleMonitorOn);
-  server.on("/rf/monitor/off", HTTP_GET, handleMonitorOff);
-  server.on("/rf/carrier/on", HTTP_GET, handleCarrierOn);
-  server.on("/rf/carrier/off", HTTP_GET, handleCarrierOff);
-  server.begin();
+  
+  if (ENABLE_WIFI) {
+    Serial.println("[INFO] Starting WiFi Access Point...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    IPAddress ip = WiFi.softAPIP();
+    
+    Serial.print("[INFO] AP SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("[INFO] AP IP: ");
+    Serial.println(ip);
+    
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/led/on", HTTP_GET, handleLedOn);
+    server.on("/led/off", HTTP_GET, handleLedOff);
+    server.on("/rf/tune/", HTTP_GET, handleTune);
+    server.on("/rf/send", HTTP_GET, handleSendPing);
+    server.on("/rf/read", HTTP_GET, handleReadPacket);
+    server.on("/rf/rssi", HTTP_GET, handleRssi);
+    server.on("/rf/sweep", HTTP_GET, handleSweep);
+    server.on("/rf/monitor/on", HTTP_GET, handleMonitorOn);
+    server.on("/rf/monitor/off", HTTP_GET, handleMonitorOff);
+    server.on("/rf/carrier/on", HTTP_GET, handleCarrierOn);
+    server.on("/rf/carrier/off", HTTP_GET, handleCarrierOff);
+    server.on("/rf/jam", HTTP_GET, handleJam);
+    
+    server.begin();
+    Serial.println("[SUCCESS] Web server started");
+  } else {
+    Serial.println("[INFO] WiFi disabled - Standalone/Flipper mode");
+    Serial.println("[INFO] Waiting for serial commands...");
+    Serial.println("[INFO] Type 'HELP' for available commands");
+  }
+  
+  Serial.println("==============================================\n");
 }
 
 void loop() {
-  server.handleClient();
-
+  if (ENABLE_WIFI) {
+    server.handleClient();
+  }
+  
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    if (command.length() > 0) {
+      processSerialCommand(command);
+    }
+  }
+  
   if (radio.monitorMode) {
     cc1101ReadPacket();
     delay(1000);
