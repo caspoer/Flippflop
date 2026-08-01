@@ -1,0 +1,23 @@
+name: ESP32 math unit tests
+
+on:
+  push:
+    paths:
+      - "esp32/**"
+      - ".github/workflows/esp32-math-tests.yml"
+  pull_request:
+    paths:
+      - "esp32/**"
+      - ".github/workflows/esp32-math-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cc1101_math tests
+        run: make -C esp32/cc1101/test test
+
+      - name: Run adf4351_math tests
+        run: make -C esp32/adf4351/test test

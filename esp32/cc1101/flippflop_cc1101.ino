@@ -2,6 +2,7 @@
 #include <WebServer.h>
 #include <uri/UriBraces.h>
 #include <SPI.h>
+#include "cc1101_math.h"
 
 const char* AP_SSID = "ESP32-C3-CC1101";
 const char* AP_PASSWORD = "88888888";
@@ -14,11 +15,6 @@ constexpr uint8_t CC1101_CS = 7;
 constexpr uint8_t CC1101_GDO0 = 10;
 constexpr float MIN_FREQUENCY_MHZ = 300.0f;
 constexpr float MAX_FREQUENCY_MHZ = 6000.0f;
-
-// CC1101 crystal oscillator frequency (standard on nesten alle CC1101-moduler)
-constexpr double CC1101_F_XOSC_HZ = 26000000.0;
-// FREQ-register er 24-bit: freq_reg = round(freq_hz * 2^16 / f_xosc)
-constexpr double CC1101_FREQ_MULT = 65536.0; // 2^16
 
 constexpr uint8_t CC1101_REG_PARTNUM = 0x30;
 constexpr uint8_t CC1101_REG_FREQ0 = 0x0D;
@@ -53,22 +49,13 @@ struct Cc1101State {
 Cc1101State radio;
 
 // --- FREQ-beregning -------------------------------------------------------
-// Regner ut FREQ2/FREQ1/FREQ0 fra ønsket frekvens i MHz.
-// freq_reg = round(freq_Hz * 2^16 / f_xosc), delt over 3 byte (MSB først).
+// Ren matte er flyttet til cc1101_math.h (host-testbar, ingen Arduino-avhengigheter).
 void cc1101ComputeFreqRegisters(float mhz, uint8_t &freq2, uint8_t &freq1, uint8_t &freq0) {
-  double freqHz = (double)mhz * 1.0e6;
-  uint32_t freqReg = (uint32_t)llround(freqHz * CC1101_FREQ_MULT / CC1101_F_XOSC_HZ);
-
-  freq2 = (uint8_t)((freqReg >> 16) & 0xFF);
-  freq1 = (uint8_t)((freqReg >> 8) & 0xFF);
-  freq0 = (uint8_t)(freqReg & 0xFF);
+  cc1101math::computeFreqRegisters(mhz, freq2, freq1, freq0);
 }
 
-// Regner tilbake fra registerverdier til MHz (nyttig for verifisering/lesing).
 float cc1101RegistersToMHz(uint8_t freq2, uint8_t freq1, uint8_t freq0) {
-  uint32_t freqReg = ((uint32_t)freq2 << 16) | ((uint32_t)freq1 << 8) | freq0;
-  double freqHz = (double)freqReg * CC1101_F_XOSC_HZ / CC1101_FREQ_MULT;
-  return (float)(freqHz / 1.0e6);
+  return cc1101math::registersToMHz(freq2, freq1, freq0);
 }
 
 void processSerialCommand(String command) {
