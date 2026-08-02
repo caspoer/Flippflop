@@ -27,11 +27,9 @@ typedef enum {
     SceneCC1101Frequency,
     SceneCC1101Power,
     SceneCC1101Sweep,
-    SceneSI5351,
-    SceneSI5351Frequency,
-    SceneSI5351FreqConv,
-    SceneSI5351LO,
-    SceneSI5351Impair,
+    SceneADF4351,
+    SceneADF4351Frequency,
+    SceneADF4351Power,
     SceneAntenna,
     SceneAbout,
 } SceneEnum;
@@ -49,17 +47,14 @@ typedef struct {
     // State
     char frequency_input[16];
     char power_input[3];
-    char rf_frequency[16];
-    char lo_frequency[16];
-    char noise_level[3];
-    
+
     // Status variables
     float current_freq;
     int8_t current_rssi;
     uint8_t current_power;
     uint8_t current_antenna;
     bool cc1101_present;
-    bool si5351_present;
+    bool adf4351_present;
     char status_text[256];
 } FlippflopApp;
 
@@ -113,8 +108,8 @@ static void flippflop_submenu_callback(void* context, uint32_t index) {
         case 0: // CC1101 Control
             view_dispatcher_send_custom_event(app->view_dispatcher, SceneCC1101);
             break;
-        case 1: // SI5351 Control
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351);
+        case 1: // ADF4351 Control
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351);
             break;
         case 2: // Antenna
             view_dispatcher_send_custom_event(app->view_dispatcher, SceneAntenna);
@@ -166,32 +161,34 @@ static void flippflop_cc1101_menu_callback(void* context, uint32_t index) {
 }
 
 // ============================================================================
-// SI5351 MENU
+// ADF4351 MENU
 // ============================================================================
 
-static void flippflop_si5351_menu_callback(void* context, uint32_t index) {
+static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     switch (index) {
         case 0: // Set Frequency
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351Frequency);
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351Frequency);
             break;
-        case 1: // Freq Conversion
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351FreqConv);
+        case 1: // Set Power
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351Power);
             break;
-        case 2: // LO Substitution
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351LO);
+        case 2: // RF Output ON
+            flippflop_uart_send_command(app, "RFOUT:ON");
+            snprintf(app->status_text, sizeof(app->status_text), "RF Output ON");
             break;
-        case 3: // Impairment
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351Impair);
+        case 3: // RF Output OFF
+            flippflop_uart_send_command(app, "RFOUT:OFF");
+            snprintf(app->status_text, sizeof(app->status_text), "RF Output OFF");
             break;
-        case 4: // Output ON
-            flippflop_uart_send_command(app, "SI5351ON");
-            snprintf(app->status_text, sizeof(app->status_text), "SI5351 Output ON");
+        case 4: // Sweep
+            flippflop_uart_send_command(app, "SWEEP");
+            snprintf(app->status_text, sizeof(app->status_text), "Sweeping...");
             break;
-        case 5: // Output OFF
-            flippflop_uart_send_command(app, "SI5351OFF");
-            snprintf(app->status_text, sizeof(app->status_text), "SI5351 Output OFF");
+        case 5: // Lock Status
+            flippflop_uart_send_command(app, "LOCK");
+            snprintf(app->status_text, sizeof(app->status_text), "Reading lock status...");
             break;
     }
 }
@@ -222,25 +219,25 @@ static void flippflop_power_input_callback(void* context) {
     }
 }
 
-static void flippflop_si5351_freq_input_callback(void* context) {
+static void flippflop_adf4351_freq_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->frequency_input) > 0) {
         char command[64];
-        snprintf(command, sizeof(command), "SI5351FREQ:%s", app->frequency_input);
+        snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
         flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "SI5351 set to %s Hz", app->frequency_input);
+        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", atof(app->frequency_input));
     }
 }
 
-static void flippflop_freqconv_callback(void* context) {
+static void flippflop_adf4351_power_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
-    if (strlen(app->rf_frequency) > 0 && strlen(app->lo_frequency) > 0) {
-        char command[128];
-        snprintf(command, sizeof(command), "FREQCONV:%s:%s", app->rf_frequency, app->lo_frequency);
+
+    if (strlen(app->power_input) > 0) {
+        char command[64];
+        snprintf(command, sizeof(command), "POWER:%s", app->power_input);
         flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "RF:%s LO:%s", app->rf_frequency, app->lo_frequency);
+        snprintf(app->status_text, sizeof(app->status_text), "Power idx set to %d", atoi(app->power_input));
     }
 }
 
@@ -280,8 +277,8 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 0, 35, "CC1101:");
     canvas_draw_str(canvas, 50, 35, app->cc1101_present ? "OK" : "NOT FOUND");
     
-    canvas_draw_str(canvas, 0, 45, "SI5351:");
-    canvas_draw_str(canvas, 50, 45, app->si5351_present ? "OK" : "NOT FOUND");
+    canvas_draw_str(canvas, 0, 45, "ADF4351:");
+    canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
     
     char freq_str[32];
     snprintf(freq_str, sizeof(freq_str), "Freq: %.2f MHz", app->current_freq);
@@ -311,7 +308,7 @@ static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
     canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignTop, "v2.0 - Advanced RF");
     
     // Features
-    canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignTop, "CC1101 + SI5351");
+    canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignTop, "CC1101 + ADF4351");
     canvas_draw_str_aligned(canvas, 64, 65, AlignCenter, AlignTop, "Press OK to continue");
 }
 
@@ -336,15 +333,15 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             view_dispatcher_switch_to_view(app->view_dispatcher, 1);
             break;
             
-        case SceneSI5351:
-            // Build SI5351 menu
+        case SceneADF4351:
+            // Build ADF4351 menu
             submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Frequency Conversion", 1, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "LO Substitution", 2, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Impairment Setup", 3, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Output ON", 4, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Output OFF", 5, flippflop_si5351_menu_callback, app);
+            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_adf4351_menu_callback, app);
+            submenu_add_item(app->submenu, "Set Power (0-3)", 1, flippflop_adf4351_menu_callback, app);
+            submenu_add_item(app->submenu, "RF Output ON", 2, flippflop_adf4351_menu_callback, app);
+            submenu_add_item(app->submenu, "RF Output OFF", 3, flippflop_adf4351_menu_callback, app);
+            submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_adf4351_menu_callback, app);
+            submenu_add_item(app->submenu, "Lock Status", 5, flippflop_adf4351_menu_callback, app);
             view_dispatcher_switch_to_view(app->view_dispatcher, 1);
             break;
             
@@ -374,11 +371,19 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             view_dispatcher_switch_to_view(app->view_dispatcher, 2);
             break;
             
-        case SceneSI5351Frequency:
-            // SI5351 frequency input
+        case SceneADF4351Frequency:
+            // ADF4351 frequency input
             text_input_reset(app->text_input);
-            text_input_set_header_text(app->text_input, "Set Freq (Hz)");
-            text_input_set_result_callback(app->text_input, flippflop_si5351_freq_input_callback, app, app->frequency_input, sizeof(app->frequency_input), true);
+            text_input_set_header_text(app->text_input, "Set Frequency (35-4400 MHz)");
+            text_input_set_result_callback(app->text_input, flippflop_adf4351_freq_input_callback, app, app->frequency_input, sizeof(app->frequency_input), true);
+            view_dispatcher_switch_to_view(app->view_dispatcher, 2);
+            break;
+
+        case SceneADF4351Power:
+            // ADF4351 power input
+            text_input_reset(app->text_input);
+            text_input_set_header_text(app->text_input, "Set Power (0-3)");
+            text_input_set_result_callback(app->text_input, flippflop_adf4351_power_input_callback, app, app->power_input, sizeof(app->power_input), true);
             view_dispatcher_switch_to_view(app->view_dispatcher, 2);
             break;
     }
@@ -408,7 +413,7 @@ static FlippflopApp* flippflop_app_alloc(void) {
     
     // Initialize main menu
     submenu_add_item(app->submenu, "CC1101 Control", 0, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "SI5351 (8kHz-160MHz)", 1, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "ADF4351 (35-4400MHz)", 1, flippflop_submenu_callback, app);
     submenu_add_item(app->submenu, "Antenna Select", 2, flippflop_submenu_callback, app);
     submenu_add_item(app->submenu, "Status", 3, flippflop_submenu_callback, app);
     submenu_add_item(app->submenu, "About", 4, flippflop_submenu_callback, app);
@@ -422,7 +427,7 @@ static FlippflopApp* flippflop_app_alloc(void) {
     app->current_power = 7;
     app->current_antenna = 0;
     app->cc1101_present = false;
-    app->si5351_present = false;
+    app->adf4351_present = false;
     
     memset(app->status_text, 0, sizeof(app->status_text));
     snprintf(app->status_text, sizeof(app->status_text), "Ready");
