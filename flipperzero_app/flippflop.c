@@ -42,10 +42,11 @@ typedef struct {
     Popup* popup;
     View* status_view;
     View* about_view;
+    SceneEnum current_scene;
 
     FuriHalSerialHandle* uart_handle;
     FuriStreamBuffer* uart_rx_buffer;
-    
+
     // State
     char frequency_input[16];
     char power_input[3];
@@ -255,9 +256,9 @@ static void flippflop_antenna_menu_callback(void* context, uint32_t index) {
 // STATUS SCREEN DRAW
 // ============================================================================
 
-static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
-    FlippflopApp* app = (FlippflopApp*)context;
-    
+static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
+    FlippflopApp* app = *(FlippflopApp**)model;
+
     canvas_clear(canvas);
     
     canvas_set_font(canvas, FontPrimary);
@@ -286,8 +287,8 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
 // MAIN VIEW DRAW
 // ============================================================================
 
-static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
-    UNUSED(context);
+static void flippflop_main_draw_callback(Canvas* canvas, void* model) {
+    UNUSED(model);
 
     canvas_clear(canvas);
     
@@ -306,48 +307,82 @@ static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
 }
 
 // ============================================================================
+// MENU BUILDERS
+// ============================================================================
+// Each of these (re)builds the shared submenu (view 1) for one logical scene
+// and records it in app->current_scene, so both forward navigation (menu
+// selection, below) and backward navigation (flippflop_navigation_event_callback)
+// can rebuild the correct menu from a single place.
+
+static void flippflop_show_main_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "CC1101 Control", 0, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "ADF4351 (35-4400MHz)", 1, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "Antenna Select", 2, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "Status", 3, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "About", 4, flippflop_submenu_callback, app);
+    app->current_scene = SceneMainMenu;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_cc1101_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Set Power (0-7)", 1, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Send Ping", 2, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Read RSSI", 3, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Carrier ON", 5, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Carrier OFF", 6, flippflop_cc1101_menu_callback, app);
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_adf4351_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Set Power (0-3)", 1, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "RF Output ON", 2, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "RF Output OFF", 3, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Lock Status", 5, flippflop_adf4351_menu_callback, app);
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_antenna_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Internal", 0, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "External-1", 1, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "External-2", 2, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "Dipole", 3, flippflop_antenna_menu_callback, app);
+    app->current_scene = SceneAntenna;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+// ============================================================================
 // SCENE MANAGEMENT
 // ============================================================================
 
 static bool flippflop_custom_event_callback(void* context, uint32_t event) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+    // Record which scene we're entering so the back-button handler
+    // (flippflop_navigation_event_callback) knows where "back" should go.
+    app->current_scene = (SceneEnum)event;
+
     switch (event) {
         case SceneCC1101:
-            // Build CC1101 menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Set Power (0-7)", 1, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Send Ping", 2, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Read RSSI", 3, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Carrier ON", 5, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Carrier OFF", 6, flippflop_cc1101_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            flippflop_show_cc1101_menu(app);
             break;
-            
+
         case SceneADF4351:
-            // Build ADF4351 menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_adf4351_menu_callback, app);
-            submenu_add_item(app->submenu, "Set Power (0-3)", 1, flippflop_adf4351_menu_callback, app);
-            submenu_add_item(app->submenu, "RF Output ON", 2, flippflop_adf4351_menu_callback, app);
-            submenu_add_item(app->submenu, "RF Output OFF", 3, flippflop_adf4351_menu_callback, app);
-            submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_adf4351_menu_callback, app);
-            submenu_add_item(app->submenu, "Lock Status", 5, flippflop_adf4351_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            flippflop_show_adf4351_menu(app);
             break;
-            
+
         case SceneAntenna:
-            // Build Antenna menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Internal", 0, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "External-1", 1, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "External-2", 2, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "Dipole", 3, flippflop_antenna_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            flippflop_show_antenna_menu(app);
             break;
-            
+
         case SceneCC1101Frequency:
             // Frequency input screen
             text_input_reset(app->text_input);
@@ -388,8 +423,44 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             view_dispatcher_switch_to_view(app->view_dispatcher, 4);
             break;
     }
-    
+
     return true;
+}
+
+// Handles the hardware Back button. There's no SceneManager here (the app
+// hand-rolls its own scene switching above), so this is the only place
+// Back is handled at all - without it, Back does nothing on any screen.
+static bool flippflop_navigation_event_callback(void* context) {
+    FlippflopApp* app = (FlippflopApp*)context;
+
+    switch (app->current_scene) {
+        case SceneCC1101:
+        case SceneADF4351:
+        case SceneAntenna:
+        case SceneCC1101Status:
+        case SceneAbout:
+            // Back from any top-level submenu/screen -> main menu
+            flippflop_show_main_menu(app);
+            return true;
+
+        case SceneCC1101Frequency:
+        case SceneCC1101Power:
+            // Back from a CC1101 input screen -> CC1101 menu
+            flippflop_show_cc1101_menu(app);
+            return true;
+
+        case SceneADF4351Frequency:
+        case SceneADF4351Power:
+            // Back from an ADF4351 input screen -> ADF4351 menu
+            flippflop_show_adf4351_menu(app);
+            return true;
+
+        case SceneMainMenu:
+        default:
+            // Already at the root menu -> exit the app
+            view_dispatcher_stop(app->view_dispatcher);
+            return true;
+    }
 }
 
 // ============================================================================
@@ -406,12 +477,16 @@ static FlippflopApp* flippflop_app_alloc(void) {
     app->text_input = text_input_alloc();
 
     app->status_view = view_alloc();
+    view_allocate_model(app->status_view, ViewModelTypeLockFree, sizeof(FlippflopApp*));
+    with_view_model(
+        app->status_view,
+        FlippflopApp** model,
+        { *model = app; },
+        false);
     view_set_draw_callback(app->status_view, flippflop_status_draw_callback);
-    view_set_context(app->status_view, app);
 
     app->about_view = view_alloc();
     view_set_draw_callback(app->about_view, flippflop_main_draw_callback);
-    view_set_context(app->about_view, app);
 
     view_dispatcher_add_view(app->view_dispatcher, 1, submenu_get_view(app->submenu));
     view_dispatcher_add_view(app->view_dispatcher, 2, text_input_get_view(app->text_input));
@@ -421,14 +496,12 @@ static FlippflopApp* flippflop_app_alloc(void) {
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, flippflop_custom_event_callback);
-    
+    view_dispatcher_set_navigation_event_callback(
+        app->view_dispatcher, flippflop_navigation_event_callback);
+
     // Initialize main menu
-    submenu_add_item(app->submenu, "CC1101 Control", 0, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "ADF4351 (35-4400MHz)", 1, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "Antenna Select", 2, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "Status", 3, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "About", 4, flippflop_submenu_callback, app);
-    
+    flippflop_show_main_menu(app);
+
     // Initialize UART
     flippflop_uart_init(app);
     
@@ -464,6 +537,7 @@ static void flippflop_app_free(FlippflopApp* app) {
 
     submenu_free(app->submenu);
     text_input_free(app->text_input);
+    view_free_model(app->status_view);
     view_free(app->status_view);
     view_free(app->about_view);
     view_dispatcher_free(app->view_dispatcher);
