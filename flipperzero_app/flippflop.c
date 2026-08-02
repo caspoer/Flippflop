@@ -193,24 +193,32 @@ static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
 
 static void flippflop_frequency_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->frequency_input) > 0) {
         char command[64];
         snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
         flippflop_uart_send_command(app, command);
         snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
     }
+
+    // Return to the CC1101 menu so confirming is visibly acknowledged
+    // instead of leaving the user stuck on the keyboard screen.
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 static void flippflop_power_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->power_input) > 0) {
         char command[64];
         snprintf(command, sizeof(command), "POWER:%s", app->power_input);
         flippflop_uart_send_command(app, command);
         snprintf(app->status_text, sizeof(app->status_text), "Power set to %d", atoi(app->power_input));
     }
+
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 static void flippflop_adf4351_freq_input_callback(void* context) {
@@ -222,6 +230,9 @@ static void flippflop_adf4351_freq_input_callback(void* context) {
         flippflop_uart_send_command(app, command);
         snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
     }
+
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 static void flippflop_adf4351_power_input_callback(void* context) {
@@ -233,6 +244,9 @@ static void flippflop_adf4351_power_input_callback(void* context) {
         flippflop_uart_send_command(app, command);
         snprintf(app->status_text, sizeof(app->status_text), "Power idx set to %d", atoi(app->power_input));
     }
+
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 // ============================================================================
