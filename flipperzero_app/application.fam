@@ -1,8 +1,10 @@
 App(
     appid="flippflop",
     name="Flippflop",
-    apptype="FlipperApplication",
+    apptype=FlipperAppType.EXTERNAL,
     entry_point="flippflop_app",
     stack_size=2 * 1024,
+    fap_category="Tools",
+    requires=["gui"],
     order=100,
 )

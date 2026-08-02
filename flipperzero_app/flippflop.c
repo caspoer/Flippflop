@@ -1,8 +1,8 @@
 #include <furi.h>
 #include <furi_hal.h>
 #include <gui/gui.h>
+#include <gui/view.h>
 #include <gui/view_dispatcher.h>
-#include <gui/scenes/generic_scene.h>
 #include <gui/view_stack.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/text_input.h>
@@ -10,14 +10,14 @@
 #include <gui/modules/menu.h>
 #include <notification/notification_messages.h>
 
-#include <furi_hal_uart.h>
-#include <furi_hal_gpio.h>
+#include <furi_hal_serial.h>
+#include <furi_hal_serial_control.h>
 
 #define FLIPPFLOP_APP_NAME "Flippflop"
 #define TAG "Flippflop"
 
 // UART Configuration
-#define UART_CHANNEL FuriHalUartChannelUSART1
+#define UART_CHANNEL FuriHalSerialIdUsart
 #define UART_BAUD 115200
 
 typedef enum {
@@ -40,8 +40,10 @@ typedef struct {
     Submenu* submenu;
     TextInput* text_input;
     Popup* popup;
-    
-    FuriThread* uart_thread;
+    View* status_view;
+    View* about_view;
+
+    FuriHalSerialHandle* uart_handle;
     FuriStreamBuffer* uart_rx_buffer;
     
     // State
@@ -62,39 +64,30 @@ typedef struct {
 // UART RX HANDLING
 // ============================================================================
 
-static int32_t flippflop_uart_worker(void* context) {
+static void flippflop_uart_rx_callback(
+    FuriHalSerialHandle* handle,
+    FuriHalSerialRxEvent event,
+    void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
-    while (true) {
-        size_t available = furi_stream_buffer_spaces_available(app->uart_rx_buffer);
-        if (available > 0) {
-            uint8_t data[64];
-            size_t read = furi_hal_uart_receive(UART_CHANNEL, data, sizeof(data), 100);
-            
-            if (read > 0) {
-                furi_stream_buffer_send(app->uart_rx_buffer, data, read);
-            }
+
+    if (event & FuriHalSerialRxEventData) {
+        while (furi_hal_serial_async_rx_available(handle)) {
+            uint8_t data = furi_hal_serial_async_rx(handle);
+            furi_stream_buffer_send(app->uart_rx_buffer, &data, 1, 0);
         }
-        furi_delay_ms(10);
     }
-    
-    return 0;
 }
 
 static void flippflop_uart_init(FlippflopApp* app) {
-    furi_hal_uart_set_br(UART_CHANNEL, UART_BAUD);
     app->uart_rx_buffer = furi_stream_buffer_alloc(256, 1);
-    app->uart_thread = furi_thread_alloc();
-    furi_thread_set_name(app->uart_thread, "FlippflopUART");
-    furi_thread_set_stack_size(app->uart_thread, 1024);
-    furi_thread_set_callback(app->uart_thread, flippflop_uart_worker);
-    furi_thread_set_context(app->uart_thread, app);
-    furi_thread_start(app->uart_thread);
+    app->uart_handle = furi_hal_serial_control_acquire(UART_CHANNEL);
+    furi_hal_serial_init(app->uart_handle, UART_BAUD);
+    furi_hal_serial_async_rx_start(app->uart_handle, flippflop_uart_rx_callback, app, false);
 }
 
 static void flippflop_uart_send_command(FlippflopApp* app, const char* command) {
-    furi_hal_uart_tx(UART_CHANNEL, (const uint8_t*)command, strlen(command));
-    furi_hal_uart_tx(UART_CHANNEL, (const uint8_t*)"\n", 1);
+    furi_hal_serial_tx(app->uart_handle, (const uint8_t*)command, strlen(command));
+    furi_hal_serial_tx(app->uart_handle, (const uint8_t*)"\n", 1);
 }
 
 // ============================================================================
@@ -204,7 +197,7 @@ static void flippflop_frequency_input_callback(void* context) {
         char command[64];
         snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
         flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", atof(app->frequency_input));
+        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
     }
 }
 
@@ -226,7 +219,7 @@ static void flippflop_adf4351_freq_input_callback(void* context) {
         char command[64];
         snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
         flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", atof(app->frequency_input));
+        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
     }
 }
 
@@ -250,7 +243,7 @@ static void flippflop_antenna_menu_callback(void* context, uint32_t index) {
     
     if (index < 4) {
         char command[32];
-        snprintf(command, sizeof(command), "ANTENNA:%d", index);
+        snprintf(command, sizeof(command), "ANTENNA:%d", (int)index);
         flippflop_uart_send_command(app, command);
         
         const char* names[] = {"Internal", "External-1", "External-2", "Dipole"};
@@ -281,7 +274,7 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
     
     char freq_str[32];
-    snprintf(freq_str, sizeof(freq_str), "Freq: %.2f MHz", app->current_freq);
+    snprintf(freq_str, sizeof(freq_str), "Freq: %.2f MHz", (double)app->current_freq);
     canvas_draw_str(canvas, 0, 55, freq_str);
     
     char rssi_str[32];
@@ -294,8 +287,8 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
 // ============================================================================
 
 static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
-    FlippflopApp* app = (FlippflopApp*)context;
-    
+    UNUSED(context);
+
     canvas_clear(canvas);
     
     canvas_set_font(canvas, FontPrimary);
@@ -386,6 +379,14 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             text_input_set_result_callback(app->text_input, flippflop_adf4351_power_input_callback, app, app->power_input, sizeof(app->power_input), true);
             view_dispatcher_switch_to_view(app->view_dispatcher, 2);
             break;
+
+        case SceneCC1101Status:
+            view_dispatcher_switch_to_view(app->view_dispatcher, 3);
+            break;
+
+        case SceneAbout:
+            view_dispatcher_switch_to_view(app->view_dispatcher, 4);
+            break;
     }
     
     return true;
@@ -403,10 +404,20 @@ static FlippflopApp* flippflop_app_alloc(void) {
     
     app->submenu = submenu_alloc();
     app->text_input = text_input_alloc();
-    
+
+    app->status_view = view_alloc();
+    view_set_draw_callback(app->status_view, flippflop_status_draw_callback);
+    view_set_context(app->status_view, app);
+
+    app->about_view = view_alloc();
+    view_set_draw_callback(app->about_view, flippflop_main_draw_callback);
+    view_set_context(app->about_view, app);
+
     view_dispatcher_add_view(app->view_dispatcher, 1, submenu_get_view(app->submenu));
     view_dispatcher_add_view(app->view_dispatcher, 2, text_input_get_view(app->text_input));
-    
+    view_dispatcher_add_view(app->view_dispatcher, 3, app->status_view);
+    view_dispatcher_add_view(app->view_dispatcher, 4, app->about_view);
+
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, flippflop_custom_event_callback);
@@ -436,20 +447,25 @@ static FlippflopApp* flippflop_app_alloc(void) {
 }
 
 static void flippflop_app_free(FlippflopApp* app) {
-    if (app->uart_thread) {
-        furi_thread_join(app->uart_thread);
-        furi_thread_free(app->uart_thread);
+    if (app->uart_handle) {
+        furi_hal_serial_async_rx_stop(app->uart_handle);
+        furi_hal_serial_deinit(app->uart_handle);
+        furi_hal_serial_control_release(app->uart_handle);
     }
-    
+
     if (app->uart_rx_buffer) {
         furi_stream_buffer_free(app->uart_rx_buffer);
     }
     
     view_dispatcher_remove_view(app->view_dispatcher, 1);
     view_dispatcher_remove_view(app->view_dispatcher, 2);
-    
+    view_dispatcher_remove_view(app->view_dispatcher, 3);
+    view_dispatcher_remove_view(app->view_dispatcher, 4);
+
     submenu_free(app->submenu);
     text_input_free(app->text_input);
+    view_free(app->status_view);
+    view_free(app->about_view);
     view_dispatcher_free(app->view_dispatcher);
     
     furi_record_close(RECORD_GUI);
