@@ -275,12 +275,12 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
     canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
     
     char freq_str[32];
-    snprintf(freq_str, sizeof(freq_str), "Freq: %.2f MHz", (double)app->current_freq);
+    snprintf(freq_str, sizeof(freq_str), "Freq:%.1f Scene:%d", (double)app->current_freq, (int)app->current_scene);
     canvas_draw_str(canvas, 0, 55, freq_str);
-    
+
     char rssi_str[32];
     snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", app->current_rssi);
-    canvas_draw_str(canvas, 0, 65, rssi_str);
+    canvas_draw_str(canvas, 0, 63, rssi_str);
 }
 
 // ============================================================================
@@ -515,7 +515,9 @@ static FlippflopApp* flippflop_app_alloc(void) {
     
     memset(app->status_text, 0, sizeof(app->status_text));
     snprintf(app->status_text, sizeof(app->status_text), "Ready");
-    
+    memset(app->frequency_input, 0, sizeof(app->frequency_input));
+    memset(app->power_input, 0, sizeof(app->power_input));
+
     return app;
 }
 
