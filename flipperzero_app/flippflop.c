@@ -244,8 +244,9 @@ static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
             break;
         }
         case 4: { // Sweep
-            // A real sweep steps the whole band on the ESP32 before replying.
-            bool ok = flippflop_uart_transact(app, "SWEEP", reply, sizeof(reply), 30000);
+            // The default 400-1000MHz/10MHz sweep takes the ESP32 about a
+            // second; don't freeze the UI far longer than the work can take.
+            bool ok = flippflop_uart_transact(app, "SWEEP", reply, sizeof(reply), 5000);
             flippflop_note_reply(app, ok);
             if(ok) {
                 const char* counts = strstr(reply, "SWEEP_DONE:");
@@ -403,8 +404,8 @@ static bool flippflop_status_field(const char* reply, const char* key, char* out
 }
 
 static void flippflop_refresh_status(FlippflopApp* app) {
-    char reply[192];
-    char field[32];
+    char reply[128];
+    char field[16];
 
     if(!flippflop_uart_transact(app, "STATUS", reply, sizeof(reply), 1500)) {
         app->adf4351_present = false;
