@@ -58,6 +58,8 @@ typedef struct {
     uint8_t current_antenna;
     bool cc1101_present;
     bool adf4351_present;
+    bool adf4351_locked;
+    bool adf4351_rfout_on;
     char status_text[256];
 } FlippflopApp;
 
@@ -87,8 +89,56 @@ static void flippflop_uart_init(FlippflopApp* app) {
 }
 
 static void flippflop_uart_send_command(FlippflopApp* app, const char* command) {
+    furi_stream_buffer_reset(app->uart_rx_buffer);
     furi_hal_serial_tx(app->uart_handle, (const uint8_t*)command, strlen(command));
     furi_hal_serial_tx(app->uart_handle, (const uint8_t*)"\n", 1);
+}
+
+// The ESP32 echoes "> CMD" before every real reply line (see
+// esp32/adf4351/flippflop_adf4351.ino processSerialCommand), so skip echo
+// lines and return the first line that actually carries a result.
+static bool flippflop_uart_read_reply(
+    FlippflopApp* app,
+    char* out,
+    size_t out_size,
+    uint32_t timeout_ms) {
+    uint32_t deadline = furi_get_tick() + furi_ms_to_ticks(timeout_ms);
+    size_t len = 0;
+
+    while(furi_get_tick() < deadline) {
+        uint8_t byte;
+        if(furi_stream_buffer_receive(app->uart_rx_buffer, &byte, 1, furi_ms_to_ticks(20)) == 0) {
+            continue;
+        }
+
+        if(byte == '\n' || byte == '\r') {
+            if(len == 0) continue;
+            out[len] = '\0';
+            if(strncmp(out, "> ", 2) == 0) {
+                len = 0;
+                continue;
+            }
+            return true;
+        }
+
+        if(len < out_size - 1) {
+            out[len++] = (char)byte;
+        }
+    }
+
+    return false;
+}
+
+// Sends a command and waits for the ESP32's reply. Returns false when nothing
+// came back, so callers can report that instead of assuming success.
+static bool flippflop_uart_transact(
+    FlippflopApp* app,
+    const char* command,
+    char* reply,
+    size_t reply_size,
+    uint32_t timeout_ms) {
+    flippflop_uart_send_command(app, command);
+    return flippflop_uart_read_reply(app, reply, reply_size, timeout_ms);
 }
 
 // ============================================================================
@@ -158,8 +208,17 @@ static void flippflop_cc1101_menu_callback(void* context, uint32_t index) {
 // ADF4351 MENU
 // ============================================================================
 
+// Any well-formed reply proves the ESP32 is actually connected and talking.
+static void flippflop_note_reply(FlippflopApp* app, bool got_reply) {
+    app->adf4351_present = got_reply;
+    if(!got_reply) {
+        snprintf(app->status_text, sizeof(app->status_text), "No response from ESP32");
+    }
+}
+
 static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
     FlippflopApp* app = (FlippflopApp*)context;
+    char reply[96];
 
     switch (index) {
         case 0: // Set Frequency
@@ -169,21 +228,48 @@ static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
             view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351Power);
             break;
         case 2: // RF Output ON
-            flippflop_uart_send_command(app, "RFOUT:ON");
-            snprintf(app->status_text, sizeof(app->status_text), "RF Output ON");
+        case 3: { // RF Output OFF
+            bool turn_on = (index == 2);
+            bool ok = flippflop_uart_transact(
+                app, turn_on ? "RFOUT:ON" : "RFOUT:OFF", reply, sizeof(reply), 1000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                app->adf4351_rfout_on = (strstr(reply, "RFOUT_ON") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "RF Output %s",
+                    app->adf4351_rfout_on ? "ON" : "OFF");
+            }
             break;
-        case 3: // RF Output OFF
-            flippflop_uart_send_command(app, "RFOUT:OFF");
-            snprintf(app->status_text, sizeof(app->status_text), "RF Output OFF");
+        }
+        case 4: { // Sweep
+            // A real sweep steps the whole band on the ESP32 before replying.
+            bool ok = flippflop_uart_transact(app, "SWEEP", reply, sizeof(reply), 30000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                const char* counts = strstr(reply, "SWEEP_DONE:");
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Sweep: %s locked",
+                    counts ? counts + strlen("SWEEP_DONE:") : reply);
+            }
             break;
-        case 4: // Sweep
-            flippflop_uart_send_command(app, "SWEEP");
-            snprintf(app->status_text, sizeof(app->status_text), "Sweeping...");
+        }
+        case 5: { // Lock Status
+            bool ok = flippflop_uart_transact(app, "LOCK", reply, sizeof(reply), 1000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                app->adf4351_locked = (strstr(reply, "LOCKED:YES") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "PLL Locked: %s",
+                    app->adf4351_locked ? "YES" : "NO");
+            }
             break;
-        case 5: // Lock Status
-            flippflop_uart_send_command(app, "LOCK");
-            snprintf(app->status_text, sizeof(app->status_text), "Reading lock status...");
-            break;
+        }
     }
 }
 
@@ -226,9 +312,25 @@ static void flippflop_adf4351_freq_input_callback(void* context) {
 
     if (strlen(app->frequency_input) > 0) {
         char command[64];
+        char reply[96];
         snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
-        flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
+        bool ok = flippflop_uart_transact(app, command, reply, sizeof(reply), 2000);
+        flippflop_note_reply(app, ok);
+        if(ok) {
+            if(strncmp(reply, "OK:TUNED:", strlen("OK:TUNED:")) == 0) {
+                app->current_freq = strtof(app->frequency_input, NULL);
+                app->adf4351_locked = (strstr(reply, "LOCKED:YES") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Tuned %.2f - Locked:%s",
+                    (double)app->current_freq,
+                    app->adf4351_locked ? "YES" : "NO");
+            } else {
+                app->adf4351_locked = false;
+                snprintf(app->status_text, sizeof(app->status_text), "Tune FAILED");
+            }
+        }
     }
 
     app->current_scene = SceneADF4351;
@@ -240,9 +342,23 @@ static void flippflop_adf4351_power_input_callback(void* context) {
 
     if (strlen(app->power_input) > 0) {
         char command[64];
+        char reply[96];
         snprintf(command, sizeof(command), "POWER:%s", app->power_input);
-        flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "Power idx set to %d", atoi(app->power_input));
+        bool ok = flippflop_uart_transact(app, command, reply, sizeof(reply), 2000);
+        flippflop_note_reply(app, ok);
+        if(ok) {
+            const char* idx = strstr(reply, "OK:POWER:");
+            if(idx) {
+                app->current_power = (uint8_t)atoi(idx + strlen("OK:POWER:"));
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Power idx %d confirmed",
+                    (int)app->current_power);
+            } else {
+                snprintf(app->status_text, sizeof(app->status_text), "Power set FAILED");
+            }
+        }
     }
 
     app->current_scene = SceneADF4351;
@@ -270,6 +386,51 @@ static void flippflop_antenna_menu_callback(void* context, uint32_t index) {
 // STATUS SCREEN DRAW
 // ============================================================================
 
+// Pulls one field out of the ESP32's pipe-separated STATUS reply, e.g.
+// "PRESENT:YES|FREQ:433.92|LOCKED:NO|..." -> field "FREQ" yields "433.92".
+static bool flippflop_status_field(const char* reply, const char* key, char* out, size_t out_size) {
+    const char* found = strstr(reply, key);
+    if(!found) return false;
+    found += strlen(key);
+
+    size_t len = 0;
+    while(found[len] && found[len] != '|' && len < out_size - 1) {
+        out[len] = found[len];
+        len++;
+    }
+    out[len] = '\0';
+    return len > 0;
+}
+
+static void flippflop_refresh_status(FlippflopApp* app) {
+    char reply[192];
+    char field[32];
+
+    if(!flippflop_uart_transact(app, "STATUS", reply, sizeof(reply), 1500)) {
+        app->adf4351_present = false;
+        snprintf(app->status_text, sizeof(app->status_text), "No response from ESP32");
+        return;
+    }
+
+    app->adf4351_present = flippflop_status_field(reply, "PRESENT:", field, sizeof(field)) &&
+                           strncmp(field, "YES", 3) == 0;
+
+    if(flippflop_status_field(reply, "FREQ:", field, sizeof(field))) {
+        app->current_freq = strtof(field, NULL);
+    }
+    if(flippflop_status_field(reply, "LOCKED:", field, sizeof(field))) {
+        app->adf4351_locked = (strncmp(field, "YES", 3) == 0);
+    }
+    if(flippflop_status_field(reply, "RFOUT:", field, sizeof(field))) {
+        app->adf4351_rfout_on = (strncmp(field, "ON", 2) == 0);
+    }
+    if(flippflop_status_field(reply, "POWER:", field, sizeof(field))) {
+        app->current_power = (uint8_t)atoi(field);
+    }
+
+    snprintf(app->status_text, sizeof(app->status_text), "Live");
+}
+
 static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
     FlippflopApp* app = *(FlippflopApp**)model;
 
@@ -289,12 +450,17 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
     canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
     
     char freq_str[32];
-    snprintf(freq_str, sizeof(freq_str), "Freq:%.1f Scene:%d", (double)app->current_freq, (int)app->current_scene);
+    snprintf(freq_str, sizeof(freq_str), "Freq:%.2f MHz Pwr:%d", (double)app->current_freq, (int)app->current_power);
     canvas_draw_str(canvas, 0, 55, freq_str);
 
-    char rssi_str[32];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", app->current_rssi);
-    canvas_draw_str(canvas, 0, 63, rssi_str);
+    char link_str[32];
+    snprintf(
+        link_str,
+        sizeof(link_str),
+        "Locked:%s  RF:%s",
+        app->adf4351_locked ? "YES" : "NO",
+        app->adf4351_rfout_on ? "ON" : "OFF");
+    canvas_draw_str(canvas, 0, 63, link_str);
 }
 
 // ============================================================================
@@ -430,6 +596,7 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             break;
 
         case SceneCC1101Status:
+            flippflop_refresh_status(app);
             view_dispatcher_switch_to_view(app->view_dispatcher, 3);
             break;
 
@@ -526,6 +693,8 @@ static FlippflopApp* flippflop_app_alloc(void) {
     app->current_antenna = 0;
     app->cc1101_present = false;
     app->adf4351_present = false;
+    app->adf4351_locked = false;
+    app->adf4351_rfout_on = false;
     
     memset(app->status_text, 0, sizeof(app->status_text));
     snprintf(app->status_text, sizeof(app->status_text), "Ready");
