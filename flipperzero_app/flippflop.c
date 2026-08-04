@@ -53,10 +53,7 @@ typedef struct {
 
     // Status variables
     float current_freq;
-    int8_t current_rssi;
     uint8_t current_power;
-    uint8_t current_antenna;
-    bool cc1101_present;
     bool adf4351_present;
     bool adf4351_locked;
     bool adf4351_rfout_on;
@@ -443,25 +440,39 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(canvas, 128, 20, AlignRight, AlignTop, app->status_text);
     
-    // CC1101 Status
+    // Nothing in this app ever probes the CC1101, so printing "NOT FOUND"
+    // would claim knowledge we don't have - same trap the ADF4351 line used
+    // to fall into.
     canvas_draw_str(canvas, 0, 35, "CC1101:");
-    canvas_draw_str(canvas, 50, 35, app->cc1101_present ? "OK" : "NOT FOUND");
-    
+    canvas_draw_str(canvas, 50, 35, "not probed");
+
     canvas_draw_str(canvas, 0, 45, "ADF4351:");
     canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
-    
-    char freq_str[32];
-    snprintf(freq_str, sizeof(freq_str), "Freq:%.2f MHz Pwr:%d", (double)app->current_freq, (int)app->current_power);
-    canvas_draw_str(canvas, 0, 55, freq_str);
 
-    char link_str[32];
-    snprintf(
-        link_str,
-        sizeof(link_str),
-        "Locked:%s  RF:%s",
-        app->adf4351_locked ? "YES" : "NO",
-        app->adf4351_rfout_on ? "ON" : "OFF");
-    canvas_draw_str(canvas, 0, 63, link_str);
+    // Only print live values when the board actually answered. Otherwise the
+    // startup defaults sit there quietly contradicting "No response from ESP32".
+    if(app->adf4351_present) {
+        char freq_str[32];
+        snprintf(
+            freq_str,
+            sizeof(freq_str),
+            "Freq:%.2f MHz Pwr:%d",
+            (double)app->current_freq,
+            (int)app->current_power);
+        canvas_draw_str(canvas, 0, 55, freq_str);
+
+        char link_str[32];
+        snprintf(
+            link_str,
+            sizeof(link_str),
+            "Locked:%s  RF:%s",
+            app->adf4351_locked ? "YES" : "NO",
+            app->adf4351_rfout_on ? "ON" : "OFF");
+        canvas_draw_str(canvas, 0, 63, link_str);
+    } else {
+        canvas_draw_str(canvas, 0, 55, "Freq:--  Pwr:--");
+        canvas_draw_str(canvas, 0, 63, "Locked:--  RF:--");
+    }
 }
 
 // ============================================================================
@@ -689,10 +700,7 @@ static FlippflopApp* flippflop_app_alloc(void) {
     
     // Initialize state
     app->current_freq = 433.92f;
-    app->current_rssi = -128;
-    app->current_power = 7;
-    app->current_antenna = 0;
-    app->cc1101_present = false;
+    app->current_power = 0;
     app->adf4351_present = false;
     app->adf4351_locked = false;
     app->adf4351_rfout_on = false;
