@@ -1,0 +1,7 @@
+# ufbt build output (Flipper Zero app)
+flipperzero_app/dist/
+flipperzero_app/.vscode/
+
+# ESP32 test build artifacts
+esp32/*/test/test_*_math
+!esp32/*/test/test_*_math.cpp

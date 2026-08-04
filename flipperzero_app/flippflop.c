@@ -1,8 +1,8 @@
 #include <furi.h>
 #include <furi_hal.h>
 #include <gui/gui.h>
+#include <gui/view.h>
 #include <gui/view_dispatcher.h>
-#include <gui/scenes/generic_scene.h>
 #include <gui/view_stack.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/text_input.h>
@@ -10,14 +10,14 @@
 #include <gui/modules/menu.h>
 #include <notification/notification_messages.h>
 
-#include <furi_hal_uart.h>
-#include <furi_hal_gpio.h>
+#include <furi_hal_serial.h>
+#include <furi_hal_serial_control.h>
 
 #define FLIPPFLOP_APP_NAME "Flippflop"
 #define TAG "Flippflop"
 
 // UART Configuration
-#define UART_CHANNEL FuriHalUartChannelUSART1
+#define UART_CHANNEL FuriHalSerialIdUsart
 #define UART_BAUD 115200
 
 typedef enum {
@@ -27,11 +27,9 @@ typedef enum {
     SceneCC1101Frequency,
     SceneCC1101Power,
     SceneCC1101Sweep,
-    SceneSI5351,
-    SceneSI5351Frequency,
-    SceneSI5351FreqConv,
-    SceneSI5351LO,
-    SceneSI5351Impair,
+    SceneADF4351,
+    SceneADF4351Frequency,
+    SceneADF4351Power,
     SceneAntenna,
     SceneAbout,
 } SceneEnum;
@@ -42,24 +40,23 @@ typedef struct {
     Submenu* submenu;
     TextInput* text_input;
     Popup* popup;
-    
-    FuriThread* uart_thread;
+    View* status_view;
+    View* about_view;
+    SceneEnum current_scene;
+
+    FuriHalSerialHandle* uart_handle;
     FuriStreamBuffer* uart_rx_buffer;
-    
+
     // State
     char frequency_input[16];
     char power_input[3];
-    char rf_frequency[16];
-    char lo_frequency[16];
-    char noise_level[3];
-    
+
     // Status variables
     float current_freq;
-    int8_t current_rssi;
     uint8_t current_power;
-    uint8_t current_antenna;
-    bool cc1101_present;
-    bool si5351_present;
+    bool adf4351_present;
+    bool adf4351_locked;
+    bool adf4351_rfout_on;
     char status_text[256];
 } FlippflopApp;
 
@@ -67,39 +64,78 @@ typedef struct {
 // UART RX HANDLING
 // ============================================================================
 
-static int32_t flippflop_uart_worker(void* context) {
+static void flippflop_uart_rx_callback(
+    FuriHalSerialHandle* handle,
+    FuriHalSerialRxEvent event,
+    void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
-    while (true) {
-        size_t available = furi_stream_buffer_spaces_available(app->uart_rx_buffer);
-        if (available > 0) {
-            uint8_t data[64];
-            size_t read = furi_hal_uart_receive(UART_CHANNEL, data, sizeof(data), 100);
-            
-            if (read > 0) {
-                furi_stream_buffer_send(app->uart_rx_buffer, data, read);
-            }
+
+    if (event & FuriHalSerialRxEventData) {
+        while (furi_hal_serial_async_rx_available(handle)) {
+            uint8_t data = furi_hal_serial_async_rx(handle);
+            furi_stream_buffer_send(app->uart_rx_buffer, &data, 1, 0);
         }
-        furi_delay_ms(10);
     }
-    
-    return 0;
 }
 
 static void flippflop_uart_init(FlippflopApp* app) {
-    furi_hal_uart_set_br(UART_CHANNEL, UART_BAUD);
     app->uart_rx_buffer = furi_stream_buffer_alloc(256, 1);
-    app->uart_thread = furi_thread_alloc();
-    furi_thread_set_name(app->uart_thread, "FlippflopUART");
-    furi_thread_set_stack_size(app->uart_thread, 1024);
-    furi_thread_set_callback(app->uart_thread, flippflop_uart_worker);
-    furi_thread_set_context(app->uart_thread, app);
-    furi_thread_start(app->uart_thread);
+    app->uart_handle = furi_hal_serial_control_acquire(UART_CHANNEL);
+    furi_hal_serial_init(app->uart_handle, UART_BAUD);
+    furi_hal_serial_async_rx_start(app->uart_handle, flippflop_uart_rx_callback, app, false);
 }
 
 static void flippflop_uart_send_command(FlippflopApp* app, const char* command) {
-    furi_hal_uart_tx(UART_CHANNEL, (const uint8_t*)command, strlen(command));
-    furi_hal_uart_tx(UART_CHANNEL, (const uint8_t*)"\n", 1);
+    furi_stream_buffer_reset(app->uart_rx_buffer);
+    furi_hal_serial_tx(app->uart_handle, (const uint8_t*)command, strlen(command));
+    furi_hal_serial_tx(app->uart_handle, (const uint8_t*)"\n", 1);
+}
+
+// The ESP32 echoes "> CMD" before every real reply line (see
+// esp32/adf4351/flippflop_adf4351.ino processSerialCommand), so skip echo
+// lines and return the first line that actually carries a result.
+static bool flippflop_uart_read_reply(
+    FlippflopApp* app,
+    char* out,
+    size_t out_size,
+    uint32_t timeout_ms) {
+    uint32_t deadline = furi_get_tick() + furi_ms_to_ticks(timeout_ms);
+    size_t len = 0;
+
+    while(furi_get_tick() < deadline) {
+        uint8_t byte;
+        if(furi_stream_buffer_receive(app->uart_rx_buffer, &byte, 1, furi_ms_to_ticks(20)) == 0) {
+            continue;
+        }
+
+        if(byte == '\n' || byte == '\r') {
+            if(len == 0) continue;
+            out[len] = '\0';
+            if(strncmp(out, "> ", 2) == 0) {
+                len = 0;
+                continue;
+            }
+            return true;
+        }
+
+        if(len < out_size - 1) {
+            out[len++] = (char)byte;
+        }
+    }
+
+    return false;
+}
+
+// Sends a command and waits for the ESP32's reply. Returns false when nothing
+// came back, so callers can report that instead of assuming success.
+static bool flippflop_uart_transact(
+    FlippflopApp* app,
+    const char* command,
+    char* reply,
+    size_t reply_size,
+    uint32_t timeout_ms) {
+    flippflop_uart_send_command(app, command);
+    return flippflop_uart_read_reply(app, reply, reply_size, timeout_ms);
 }
 
 // ============================================================================
@@ -113,8 +149,8 @@ static void flippflop_submenu_callback(void* context, uint32_t index) {
         case 0: // CC1101 Control
             view_dispatcher_send_custom_event(app->view_dispatcher, SceneCC1101);
             break;
-        case 1: // SI5351 Control
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351);
+        case 1: // ADF4351 Control
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351);
             break;
         case 2: // Antenna
             view_dispatcher_send_custom_event(app->view_dispatcher, SceneAntenna);
@@ -166,33 +202,72 @@ static void flippflop_cc1101_menu_callback(void* context, uint32_t index) {
 }
 
 // ============================================================================
-// SI5351 MENU
+// ADF4351 MENU
 // ============================================================================
 
-static void flippflop_si5351_menu_callback(void* context, uint32_t index) {
+// Any well-formed reply proves the ESP32 is actually connected and talking.
+static void flippflop_note_reply(FlippflopApp* app, bool got_reply) {
+    app->adf4351_present = got_reply;
+    if(!got_reply) {
+        snprintf(app->status_text, sizeof(app->status_text), "No response from ESP32");
+    }
+}
+
+static void flippflop_adf4351_menu_callback(void* context, uint32_t index) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+    char reply[96];
+
     switch (index) {
         case 0: // Set Frequency
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351Frequency);
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351Frequency);
             break;
-        case 1: // Freq Conversion
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351FreqConv);
+        case 1: // Set Power
+            view_dispatcher_send_custom_event(app->view_dispatcher, SceneADF4351Power);
             break;
-        case 2: // LO Substitution
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351LO);
+        case 2: // RF Output ON
+        case 3: { // RF Output OFF
+            bool turn_on = (index == 2);
+            bool ok = flippflop_uart_transact(
+                app, turn_on ? "RFOUT:ON" : "RFOUT:OFF", reply, sizeof(reply), 1000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                app->adf4351_rfout_on = (strstr(reply, "RFOUT_ON") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "RF Output %s",
+                    app->adf4351_rfout_on ? "ON" : "OFF");
+            }
             break;
-        case 3: // Impairment
-            view_dispatcher_send_custom_event(app->view_dispatcher, SceneSI5351Impair);
+        }
+        case 4: { // Sweep
+            // The default 400-1000MHz/10MHz sweep takes the ESP32 about a
+            // second; don't freeze the UI far longer than the work can take.
+            bool ok = flippflop_uart_transact(app, "SWEEP", reply, sizeof(reply), 5000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                const char* counts = strstr(reply, "SWEEP_DONE:");
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Sweep: %s locked",
+                    counts ? counts + strlen("SWEEP_DONE:") : reply);
+            }
             break;
-        case 4: // Output ON
-            flippflop_uart_send_command(app, "SI5351ON");
-            snprintf(app->status_text, sizeof(app->status_text), "SI5351 Output ON");
+        }
+        case 5: { // Lock Status
+            bool ok = flippflop_uart_transact(app, "LOCK", reply, sizeof(reply), 1000);
+            flippflop_note_reply(app, ok);
+            if(ok) {
+                app->adf4351_locked = (strstr(reply, "LOCKED:YES") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "PLL Locked: %s",
+                    app->adf4351_locked ? "YES" : "NO");
+            }
             break;
-        case 5: // Output OFF
-            flippflop_uart_send_command(app, "SI5351OFF");
-            snprintf(app->status_text, sizeof(app->status_text), "SI5351 Output OFF");
-            break;
+        }
     }
 }
 
@@ -202,46 +277,90 @@ static void flippflop_si5351_menu_callback(void* context, uint32_t index) {
 
 static void flippflop_frequency_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->frequency_input) > 0) {
         char command[64];
         snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
         flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", atof(app->frequency_input));
+        snprintf(app->status_text, sizeof(app->status_text), "Set to %.2f MHz", (double)strtof(app->frequency_input, NULL));
     }
+
+    // Return to the CC1101 menu so confirming is visibly acknowledged
+    // instead of leaving the user stuck on the keyboard screen.
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 static void flippflop_power_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->power_input) > 0) {
         char command[64];
         snprintf(command, sizeof(command), "POWER:%s", app->power_input);
         flippflop_uart_send_command(app, command);
         snprintf(app->status_text, sizeof(app->status_text), "Power set to %d", atoi(app->power_input));
     }
+
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
-static void flippflop_si5351_freq_input_callback(void* context) {
+static void flippflop_adf4351_freq_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+
     if (strlen(app->frequency_input) > 0) {
         char command[64];
-        snprintf(command, sizeof(command), "SI5351FREQ:%s", app->frequency_input);
-        flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "SI5351 set to %s Hz", app->frequency_input);
+        char reply[96];
+        snprintf(command, sizeof(command), "TUNE:%s", app->frequency_input);
+        bool ok = flippflop_uart_transact(app, command, reply, sizeof(reply), 2000);
+        flippflop_note_reply(app, ok);
+        if(ok) {
+            if(strncmp(reply, "OK:TUNED:", strlen("OK:TUNED:")) == 0) {
+                app->current_freq = strtof(app->frequency_input, NULL);
+                app->adf4351_locked = (strstr(reply, "LOCKED:YES") != NULL);
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Tuned %.2f - Locked:%s",
+                    (double)app->current_freq,
+                    app->adf4351_locked ? "YES" : "NO");
+            } else {
+                app->adf4351_locked = false;
+                snprintf(app->status_text, sizeof(app->status_text), "Tune FAILED");
+            }
+        }
     }
+
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
-static void flippflop_freqconv_callback(void* context) {
+static void flippflop_adf4351_power_input_callback(void* context) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
-    if (strlen(app->rf_frequency) > 0 && strlen(app->lo_frequency) > 0) {
-        char command[128];
-        snprintf(command, sizeof(command), "FREQCONV:%s:%s", app->rf_frequency, app->lo_frequency);
-        flippflop_uart_send_command(app, command);
-        snprintf(app->status_text, sizeof(app->status_text), "RF:%s LO:%s", app->rf_frequency, app->lo_frequency);
+
+    if (strlen(app->power_input) > 0) {
+        char command[64];
+        char reply[96];
+        snprintf(command, sizeof(command), "POWER:%s", app->power_input);
+        bool ok = flippflop_uart_transact(app, command, reply, sizeof(reply), 2000);
+        flippflop_note_reply(app, ok);
+        if(ok) {
+            const char* idx = strstr(reply, "OK:POWER:");
+            if(idx) {
+                app->current_power = (uint8_t)atoi(idx + strlen("OK:POWER:"));
+                snprintf(
+                    app->status_text,
+                    sizeof(app->status_text),
+                    "Power idx %d confirmed",
+                    (int)app->current_power);
+            } else {
+                snprintf(app->status_text, sizeof(app->status_text), "Power set FAILED");
+            }
+        }
     }
+
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 // ============================================================================
@@ -253,7 +372,7 @@ static void flippflop_antenna_menu_callback(void* context, uint32_t index) {
     
     if (index < 4) {
         char command[32];
-        snprintf(command, sizeof(command), "ANTENNA:%d", index);
+        snprintf(command, sizeof(command), "ANTENNA:%d", (int)index);
         flippflop_uart_send_command(app, command);
         
         const char* names[] = {"Internal", "External-1", "External-2", "Dipole"};
@@ -265,9 +384,54 @@ static void flippflop_antenna_menu_callback(void* context, uint32_t index) {
 // STATUS SCREEN DRAW
 // ============================================================================
 
-static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
-    FlippflopApp* app = (FlippflopApp*)context;
-    
+// Pulls one field out of the ESP32's pipe-separated STATUS reply, e.g.
+// "PRESENT:YES|FREQ:433.92|LOCKED:NO|..." -> field "FREQ" yields "433.92".
+static bool flippflop_status_field(const char* reply, const char* key, char* out, size_t out_size) {
+    const char* found = strstr(reply, key);
+    if(!found) return false;
+    found += strlen(key);
+
+    size_t len = 0;
+    while(found[len] && found[len] != '|' && len < out_size - 1) {
+        out[len] = found[len];
+        len++;
+    }
+    out[len] = '\0';
+    return len > 0;
+}
+
+static void flippflop_refresh_status(FlippflopApp* app) {
+    char reply[128];
+    char field[16];
+
+    if(!flippflop_uart_transact(app, "STATUS", reply, sizeof(reply), 1500)) {
+        app->adf4351_present = false;
+        snprintf(app->status_text, sizeof(app->status_text), "No response from ESP32");
+        return;
+    }
+
+    app->adf4351_present = flippflop_status_field(reply, "PRESENT:", field, sizeof(field)) &&
+                           strncmp(field, "YES", 3) == 0;
+
+    if(flippflop_status_field(reply, "FREQ:", field, sizeof(field))) {
+        app->current_freq = strtof(field, NULL);
+    }
+    if(flippflop_status_field(reply, "LOCKED:", field, sizeof(field))) {
+        app->adf4351_locked = (strncmp(field, "YES", 3) == 0);
+    }
+    if(flippflop_status_field(reply, "RFOUT:", field, sizeof(field))) {
+        app->adf4351_rfout_on = (strncmp(field, "ON", 2) == 0);
+    }
+    if(flippflop_status_field(reply, "POWER:", field, sizeof(field))) {
+        app->current_power = (uint8_t)atoi(field);
+    }
+
+    snprintf(app->status_text, sizeof(app->status_text), "Live");
+}
+
+static void flippflop_status_draw_callback(Canvas* canvas, void* model) {
+    FlippflopApp* app = *(FlippflopApp**)model;
+
     canvas_clear(canvas);
     
     canvas_set_font(canvas, FontPrimary);
@@ -276,29 +440,48 @@ static void flippflop_status_draw_callback(Canvas* canvas, void* context) {
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(canvas, 128, 20, AlignRight, AlignTop, app->status_text);
     
-    // CC1101 Status
+    // Nothing in this app ever probes the CC1101, so printing "NOT FOUND"
+    // would claim knowledge we don't have - same trap the ADF4351 line used
+    // to fall into.
     canvas_draw_str(canvas, 0, 35, "CC1101:");
-    canvas_draw_str(canvas, 50, 35, app->cc1101_present ? "OK" : "NOT FOUND");
-    
-    canvas_draw_str(canvas, 0, 45, "SI5351:");
-    canvas_draw_str(canvas, 50, 45, app->si5351_present ? "OK" : "NOT FOUND");
-    
-    char freq_str[32];
-    snprintf(freq_str, sizeof(freq_str), "Freq: %.2f MHz", app->current_freq);
-    canvas_draw_str(canvas, 0, 55, freq_str);
-    
-    char rssi_str[32];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI: %d dBm", app->current_rssi);
-    canvas_draw_str(canvas, 0, 65, rssi_str);
+    canvas_draw_str(canvas, 50, 35, "not probed");
+
+    canvas_draw_str(canvas, 0, 45, "ADF4351:");
+    canvas_draw_str(canvas, 50, 45, app->adf4351_present ? "OK" : "NOT FOUND");
+
+    // Only print live values when the board actually answered. Otherwise the
+    // startup defaults sit there quietly contradicting "No response from ESP32".
+    if(app->adf4351_present) {
+        char freq_str[32];
+        snprintf(
+            freq_str,
+            sizeof(freq_str),
+            "Freq:%.2f MHz Pwr:%d",
+            (double)app->current_freq,
+            (int)app->current_power);
+        canvas_draw_str(canvas, 0, 55, freq_str);
+
+        char link_str[32];
+        snprintf(
+            link_str,
+            sizeof(link_str),
+            "Locked:%s  RF:%s",
+            app->adf4351_locked ? "YES" : "NO",
+            app->adf4351_rfout_on ? "ON" : "OFF");
+        canvas_draw_str(canvas, 0, 63, link_str);
+    } else {
+        canvas_draw_str(canvas, 0, 55, "Freq:--  Pwr:--");
+        canvas_draw_str(canvas, 0, 63, "Locked:--  RF:--");
+    }
 }
 
 // ============================================================================
 // MAIN VIEW DRAW
 // ============================================================================
 
-static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
-    FlippflopApp* app = (FlippflopApp*)context;
-    
+static void flippflop_main_draw_callback(Canvas* canvas, void* model) {
+    UNUSED(model);
+
     canvas_clear(canvas);
     
     canvas_set_font(canvas, FontPrimary);
@@ -311,8 +494,62 @@ static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
     canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignTop, "v2.0 - Advanced RF");
     
     // Features
-    canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignTop, "CC1101 + SI5351");
+    canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignTop, "CC1101 + ADF4351");
     canvas_draw_str_aligned(canvas, 64, 65, AlignCenter, AlignTop, "Press OK to continue");
+}
+
+// ============================================================================
+// MENU BUILDERS
+// ============================================================================
+// Each of these (re)builds the shared submenu (view 1) for one logical scene
+// and records it in app->current_scene, so both forward navigation (menu
+// selection, below) and backward navigation (flippflop_navigation_event_callback)
+// can rebuild the correct menu from a single place.
+
+static void flippflop_show_main_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "CC1101 Control", 0, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "ADF4351 (35-4400MHz)", 1, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "Antenna Select", 2, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "Status", 3, flippflop_submenu_callback, app);
+    submenu_add_item(app->submenu, "About", 4, flippflop_submenu_callback, app);
+    app->current_scene = SceneMainMenu;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_cc1101_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Set Power (0-7)", 1, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Send Ping", 2, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Read RSSI", 3, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Carrier ON", 5, flippflop_cc1101_menu_callback, app);
+    submenu_add_item(app->submenu, "Carrier OFF", 6, flippflop_cc1101_menu_callback, app);
+    app->current_scene = SceneCC1101;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_adf4351_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Set Power (0-3)", 1, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "RF Output ON", 2, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "RF Output OFF", 3, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_adf4351_menu_callback, app);
+    submenu_add_item(app->submenu, "Lock Status", 5, flippflop_adf4351_menu_callback, app);
+    app->current_scene = SceneADF4351;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+}
+
+static void flippflop_show_antenna_menu(FlippflopApp* app) {
+    submenu_reset(app->submenu);
+    submenu_add_item(app->submenu, "Internal", 0, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "External-1", 1, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "External-2", 2, flippflop_antenna_menu_callback, app);
+    submenu_add_item(app->submenu, "Dipole", 3, flippflop_antenna_menu_callback, app);
+    app->current_scene = SceneAntenna;
+    view_dispatcher_switch_to_view(app->view_dispatcher, 1);
 }
 
 // ============================================================================
@@ -321,43 +558,23 @@ static void flippflop_main_draw_callback(Canvas* canvas, void* context) {
 
 static bool flippflop_custom_event_callback(void* context, uint32_t event) {
     FlippflopApp* app = (FlippflopApp*)context;
-    
+    // Record which scene we're entering so the back-button handler
+    // (flippflop_navigation_event_callback) knows where "back" should go.
+    app->current_scene = (SceneEnum)event;
+
     switch (event) {
         case SceneCC1101:
-            // Build CC1101 menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Set Power (0-7)", 1, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Send Ping", 2, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Read RSSI", 3, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Sweep Band", 4, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Carrier ON", 5, flippflop_cc1101_menu_callback, app);
-            submenu_add_item(app->submenu, "Carrier OFF", 6, flippflop_cc1101_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            flippflop_show_cc1101_menu(app);
             break;
-            
-        case SceneSI5351:
-            // Build SI5351 menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Set Frequency", 0, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Frequency Conversion", 1, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "LO Substitution", 2, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Impairment Setup", 3, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Output ON", 4, flippflop_si5351_menu_callback, app);
-            submenu_add_item(app->submenu, "Output OFF", 5, flippflop_si5351_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+
+        case SceneADF4351:
+            flippflop_show_adf4351_menu(app);
             break;
-            
+
         case SceneAntenna:
-            // Build Antenna menu
-            submenu_reset(app->submenu);
-            submenu_add_item(app->submenu, "Internal", 0, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "External-1", 1, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "External-2", 2, flippflop_antenna_menu_callback, app);
-            submenu_add_item(app->submenu, "Dipole", 3, flippflop_antenna_menu_callback, app);
-            view_dispatcher_switch_to_view(app->view_dispatcher, 1);
+            flippflop_show_antenna_menu(app);
             break;
-            
+
         case SceneCC1101Frequency:
             // Frequency input screen
             text_input_reset(app->text_input);
@@ -374,16 +591,69 @@ static bool flippflop_custom_event_callback(void* context, uint32_t event) {
             view_dispatcher_switch_to_view(app->view_dispatcher, 2);
             break;
             
-        case SceneSI5351Frequency:
-            // SI5351 frequency input
+        case SceneADF4351Frequency:
+            // ADF4351 frequency input
             text_input_reset(app->text_input);
-            text_input_set_header_text(app->text_input, "Set Freq (Hz)");
-            text_input_set_result_callback(app->text_input, flippflop_si5351_freq_input_callback, app, app->frequency_input, sizeof(app->frequency_input), true);
+            text_input_set_header_text(app->text_input, "Set Frequency (35-4400 MHz)");
+            text_input_set_result_callback(app->text_input, flippflop_adf4351_freq_input_callback, app, app->frequency_input, sizeof(app->frequency_input), true);
             view_dispatcher_switch_to_view(app->view_dispatcher, 2);
             break;
+
+        case SceneADF4351Power:
+            // ADF4351 power input
+            text_input_reset(app->text_input);
+            text_input_set_header_text(app->text_input, "Set Power (0-3)");
+            text_input_set_result_callback(app->text_input, flippflop_adf4351_power_input_callback, app, app->power_input, sizeof(app->power_input), true);
+            view_dispatcher_switch_to_view(app->view_dispatcher, 2);
+            break;
+
+        case SceneCC1101Status:
+            flippflop_refresh_status(app);
+            view_dispatcher_switch_to_view(app->view_dispatcher, 3);
+            break;
+
+        case SceneAbout:
+            view_dispatcher_switch_to_view(app->view_dispatcher, 4);
+            break;
     }
-    
+
     return true;
+}
+
+// Handles the hardware Back button. There's no SceneManager here (the app
+// hand-rolls its own scene switching above), so this is the only place
+// Back is handled at all - without it, Back does nothing on any screen.
+static bool flippflop_navigation_event_callback(void* context) {
+    FlippflopApp* app = (FlippflopApp*)context;
+
+    switch (app->current_scene) {
+        case SceneCC1101:
+        case SceneADF4351:
+        case SceneAntenna:
+        case SceneCC1101Status:
+        case SceneAbout:
+            // Back from any top-level submenu/screen -> main menu
+            flippflop_show_main_menu(app);
+            return true;
+
+        case SceneCC1101Frequency:
+        case SceneCC1101Power:
+            // Back from a CC1101 input screen -> CC1101 menu
+            flippflop_show_cc1101_menu(app);
+            return true;
+
+        case SceneADF4351Frequency:
+        case SceneADF4351Power:
+            // Back from an ADF4351 input screen -> ADF4351 menu
+            flippflop_show_adf4351_menu(app);
+            return true;
+
+        case SceneMainMenu:
+        default:
+            // Already at the root menu -> exit the app
+            view_dispatcher_stop(app->view_dispatcher);
+            return true;
+    }
 }
 
 // ============================================================================
@@ -398,53 +668,72 @@ static FlippflopApp* flippflop_app_alloc(void) {
     
     app->submenu = submenu_alloc();
     app->text_input = text_input_alloc();
-    
+
+    app->status_view = view_alloc();
+    view_allocate_model(app->status_view, ViewModelTypeLockFree, sizeof(FlippflopApp*));
+    with_view_model(
+        app->status_view,
+        FlippflopApp** model,
+        { *model = app; },
+        false);
+    view_set_draw_callback(app->status_view, flippflop_status_draw_callback);
+
+    app->about_view = view_alloc();
+    view_set_draw_callback(app->about_view, flippflop_main_draw_callback);
+
     view_dispatcher_add_view(app->view_dispatcher, 1, submenu_get_view(app->submenu));
     view_dispatcher_add_view(app->view_dispatcher, 2, text_input_get_view(app->text_input));
-    
+    view_dispatcher_add_view(app->view_dispatcher, 3, app->status_view);
+    view_dispatcher_add_view(app->view_dispatcher, 4, app->about_view);
+
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, flippflop_custom_event_callback);
-    
+    view_dispatcher_set_navigation_event_callback(
+        app->view_dispatcher, flippflop_navigation_event_callback);
+
     // Initialize main menu
-    submenu_add_item(app->submenu, "CC1101 Control", 0, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "SI5351 (8kHz-160MHz)", 1, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "Antenna Select", 2, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "Status", 3, flippflop_submenu_callback, app);
-    submenu_add_item(app->submenu, "About", 4, flippflop_submenu_callback, app);
-    
+    flippflop_show_main_menu(app);
+
     // Initialize UART
     flippflop_uart_init(app);
     
     // Initialize state
     app->current_freq = 433.92f;
-    app->current_rssi = -128;
-    app->current_power = 7;
-    app->current_antenna = 0;
-    app->cc1101_present = false;
-    app->si5351_present = false;
+    app->current_power = 0;
+    app->adf4351_present = false;
+    app->adf4351_locked = false;
+    app->adf4351_rfout_on = false;
     
     memset(app->status_text, 0, sizeof(app->status_text));
     snprintf(app->status_text, sizeof(app->status_text), "Ready");
-    
+    memset(app->frequency_input, 0, sizeof(app->frequency_input));
+    memset(app->power_input, 0, sizeof(app->power_input));
+
     return app;
 }
 
 static void flippflop_app_free(FlippflopApp* app) {
-    if (app->uart_thread) {
-        furi_thread_join(app->uart_thread);
-        furi_thread_free(app->uart_thread);
+    if (app->uart_handle) {
+        furi_hal_serial_async_rx_stop(app->uart_handle);
+        furi_hal_serial_deinit(app->uart_handle);
+        furi_hal_serial_control_release(app->uart_handle);
     }
-    
+
     if (app->uart_rx_buffer) {
         furi_stream_buffer_free(app->uart_rx_buffer);
     }
     
     view_dispatcher_remove_view(app->view_dispatcher, 1);
     view_dispatcher_remove_view(app->view_dispatcher, 2);
-    
+    view_dispatcher_remove_view(app->view_dispatcher, 3);
+    view_dispatcher_remove_view(app->view_dispatcher, 4);
+
     submenu_free(app->submenu);
     text_input_free(app->text_input);
+    view_free_model(app->status_view);
+    view_free(app->status_view);
+    view_free(app->about_view);
     view_dispatcher_free(app->view_dispatcher);
     
     furi_record_close(RECORD_GUI);

@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <uri/UriBraces.h>
 #include <SPI.h>
+#include "cc1101_math.h"
 
 const char* AP_SSID = "ESP32-C3-CC1101";
 const char* AP_PASSWORD = "88888888";
@@ -23,6 +25,11 @@ constexpr uint16_t MAX_SWEEP_ITERATIONS = 10000;
 constexpr float MIN_SWEEP_STEP = 0.01f;
 constexpr bool ENABLE_WIFI = true;
 
+// Hvor mange punkter av et sveip vi tar vare på for spektrumsgrafen. Lengre
+// sveip desimeres ned til dette, slik at grafen dekker hele bandet uansett
+// steglengde - og slik at JSON-svaret holder seg lite nok for ESP32-en.
+constexpr uint16_t SPECTRUM_MAX_POINTS = 256;
+
 WebServer server(80);
 
 struct Cc1101State {
@@ -37,14 +44,33 @@ struct Cc1101State {
   bool jamActive = false;
   uint16_t jamCount = 0;
   uint16_t jamSent = 0;
-  float sweepStartMHz = MIN_FREQUENCY_MHZ;
-  float sweepStopMHz = MAX_FREQUENCY_MHZ;
+  // Default-sveipet dekker CC1101 sine faktiske band (300-348, 387-464,
+  // 779-928 MHz). MAX_FREQUENCY_MHZ er 6000 for at TUNE skal slippe gjennom
+  // hva som helst, men a sveipe dit gir bare stoy - chipen kan ikke motta der.
+  float sweepStartMHz = 300.0f;
+  float sweepStopMHz = 928.0f;
   float sweepStepMHz = 1.0f;
   float sweepBestMHz = 0.0f;
   int8_t sweepBestRssi = -128;
+
+  // Hele sveipesporet, for spektrumsgrafen.
+  int8_t spectrumRssi[SPECTRUM_MAX_POINTS];
+  uint16_t spectrumPoints = 0;
+  float spectrumStartMHz = 0.0f;
+  float spectrumStepMHz = 0.0f;
 };
 
 Cc1101State radio;
+
+// --- FREQ-beregning -------------------------------------------------------
+// Ren matte er flyttet til cc1101_math.h (host-testbar, ingen Arduino-avhengigheter).
+void cc1101ComputeFreqRegisters(float mhz, uint8_t &freq2, uint8_t &freq1, uint8_t &freq0) {
+  cc1101math::computeFreqRegisters(mhz, freq2, freq1, freq0);
+}
+
+float cc1101RegistersToMHz(uint8_t freq2, uint8_t freq1, uint8_t freq0) {
+  return cc1101math::registersToMHz(freq2, freq1, freq0);
+}
 
 void processSerialCommand(String command) {
   command.trim();
@@ -184,9 +210,8 @@ bool cc1101Init() {
   radio.present = (partNumber != 0xFF);
   
   if (radio.present) {
-    cc1101WriteRegister(CC1101_REG_FREQ0, 0x06);
-    cc1101WriteRegister(CC1101_REG_FREQ1, 0x00);
-    cc1101WriteRegister(CC1101_REG_FREQ2, 0x00);
+    // Sett faktiske FREQ-registre for standard 433.92 MHz istedenfor hardkodede byte
+    cc1101SetFrequency(radio.frequencyMHz);
     radio.rssi = -55;
     strncpy(radio.lastPacket, "ready", sizeof(radio.lastPacket) - 1);
     radio.lastPacket[sizeof(radio.lastPacket) - 1] = '\0';
@@ -199,6 +224,11 @@ bool cc1101Init() {
 void cc1101SetFrequency(float mhz) {
   radio.frequencyMHz = mhz;
   if (radio.present) {
+    uint8_t freq2, freq1, freq0;
+    cc1101ComputeFreqRegisters(mhz, freq2, freq1, freq0);
+    cc1101WriteRegister(CC1101_REG_FREQ2, freq2);
+    cc1101WriteRegister(CC1101_REG_FREQ1, freq1);
+    cc1101WriteRegister(CC1101_REG_FREQ0, freq0);
     radio.rssi = -60;
     snprintf(radio.lastPacket, sizeof(radio.lastPacket), "tuned %.2f", mhz);
   }
@@ -292,6 +322,16 @@ void cc1101SweepFrequencies() {
     return;
   }
   
+  // Ta vare pa hvert stride-te punkt, slik at grafen dekker hele bandet
+  // uansett hvor fint brukeren har satt steglengden.
+  uint16_t stride = (estimatedIterations + SPECTRUM_MAX_POINTS - 1) / SPECTRUM_MAX_POINTS;
+  if (stride < 1) stride = 1;
+
+  radio.spectrumPoints = 0;
+  radio.spectrumStartMHz = radio.sweepStartMHz;
+  radio.spectrumStepMHz = radio.sweepStepMHz * stride;
+
+  uint16_t index = 0;
   for (float freq = radio.sweepStartMHz; freq <= radio.sweepStopMHz; freq += radio.sweepStepMHz) {
     cc1101SetFrequency(freq);
     int8_t sampleRssi = cc1101ReadRssi();
@@ -299,9 +339,15 @@ void cc1101SweepFrequencies() {
       radio.sweepBestRssi = sampleRssi;
       radio.sweepBestMHz = freq;
     }
+
+    if (index % stride == 0 && radio.spectrumPoints < SPECTRUM_MAX_POINTS) {
+      radio.spectrumRssi[radio.spectrumPoints++] = sampleRssi;
+    }
+    index++;
+
     delay(20);
   }
-  
+
   snprintf(radio.lastPacket, sizeof(radio.lastPacket), "sweep best %.2f", radio.sweepBestMHz);
 }
 
@@ -356,6 +402,66 @@ String buildHtml() {
     </form>
   </div>
   <div class="card">
+    <h3>Spectrum</h3>
+    <form id="sweepForm" style="margin-bottom: 8px;">
+      <input id="fStart" type="number" step="0.01" value="300" style="width: 88px;" />
+      <input id="fStop" type="number" step="0.01" value="928" style="width: 88px;" />
+      <input id="fStep" type="number" step="0.01" value="1" style="width: 68px;" />
+      <button type="submit" class="blue" style="padding: 8px 12px;">Sweep</button>
+    </form>
+    <canvas id="plot" width="480" height="200" style="width: 100%; background: #0b1220; border-radius: 8px;"></canvas>
+    <p id="peak">No sweep yet</p>
+  </div>
+  <script>
+    var cv = document.getElementById('plot');
+    var ctx = cv.getContext('2d');
+    var LO = -120, HI = -20;
+
+    function draw(d) {
+      var w = cv.width, h = cv.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = '#1e293b';
+      for (var g = 0; g <= 4; g++) {
+        var gy = h * g / 4;
+        ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+      }
+      if (!d.points) { return; }
+
+      var peak = 0;
+      ctx.strokeStyle = '#38bdf8';
+      ctx.beginPath();
+      for (var i = 0; i < d.points; i++) {
+        if (d.rssi[i] > d.rssi[peak]) { peak = i; }
+        var px = d.points > 1 ? w * i / (d.points - 1) : 0;
+        var py = h - h * (d.rssi[i] - LO) / (HI - LO);
+        if (py < 0) { py = 0; } else if (py > h) { py = h; }
+        if (i) { ctx.lineTo(px, py); } else { ctx.moveTo(px, py); }
+      }
+      ctx.stroke();
+
+      var pf = (d.startMHz + peak * d.stepMHz).toFixed(2);
+      document.getElementById('peak').textContent =
+        'Peak: ' + pf + ' MHz at ' + d.rssi[peak] + ' dBm  (' + d.points + ' points)';
+    }
+
+    document.getElementById('sweepForm').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var q = '?start=' + document.getElementById('fStart').value +
+              '&stop=' + document.getElementById('fStop').value +
+              '&step=' + document.getElementById('fStep').value;
+      document.getElementById('peak').textContent = 'Sweeping...';
+      fetch('/rf/sweep' + q)
+        .then(function () { return fetch('/rf/spectrum'); })
+        .then(function (r) { return r.json(); })
+        .then(draw)
+        .catch(function (err) {
+          document.getElementById('peak').textContent = 'Sweep failed: ' + err;
+        });
+    });
+
+    fetch('/rf/spectrum').then(function (r) { return r.json(); }).then(draw).catch(function () {});
+  </script>
+  <div class="card">
     <h3>Status</h3>
     <p>CC1101 Present: <strong>)HTML";
   html += radio.present ? "yes" : "no";
@@ -403,6 +509,8 @@ void handleLedOff() {
   server.send(302, "text/plain", "LED OFF");
 }
 
+// Håndterer BÅDE /rf/tune/{freq} (path-parameter via UriBraces)
+// OG /rf/tune/?freq=xxx (query-parameter), avhengig av hvilken route som traff.
 void handleTune() {
   String freqValue = server.pathArg(0);
   if (freqValue.length() == 0) {
@@ -438,8 +546,33 @@ void handleRssi() {
 }
 
 void handleSweep() {
+  // Valgfrie parametre: /rf/sweep?start=300&stop=928&step=1
+  // Utelates de, brukes forrige (eller default) omrade.
+  if (server.hasArg("start")) radio.sweepStartMHz = server.arg("start").toFloat();
+  if (server.hasArg("stop")) radio.sweepStopMHz = server.arg("stop").toFloat();
+  if (server.hasArg("step")) radio.sweepStepMHz = server.arg("step").toFloat();
+
   cc1101SweepFrequencies();
   String payload = "{\"bestMHz\":" + String(radio.sweepBestMHz, 2) + ",\"bestRssi\":" + String(radio.sweepBestRssi) + "}";
+  server.send(200, "application/json", payload);
+}
+
+// Selve sveipesporet, som grafen i nettleseren tegner.
+void handleSpectrum() {
+  String payload;
+  payload.reserve(SPECTRUM_MAX_POINTS * 5 + 96);
+  payload += "{\"startMHz\":";
+  payload += String(radio.spectrumStartMHz, 2);
+  payload += ",\"stepMHz\":";
+  payload += String(radio.spectrumStepMHz, 4);
+  payload += ",\"points\":";
+  payload += String(radio.spectrumPoints);
+  payload += ",\"rssi\":[";
+  for (uint16_t i = 0; i < radio.spectrumPoints; i++) {
+    if (i) payload += ",";
+    payload += String(radio.spectrumRssi[i]);
+  }
+  payload += "]}";
   server.send(200, "application/json", payload);
 }
 
@@ -513,11 +646,15 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/led/on", HTTP_GET, handleLedOn);
     server.on("/led/off", HTTP_GET, handleLedOff);
+    // Query-form: /rf/tune/?freq=433.92
     server.on("/rf/tune/", HTTP_GET, handleTune);
+    // Path-form: /rf/tune/433.92  (krever UriBraces for at ESP32 WebServer skal fange parameteren)
+    server.on(UriBraces("/rf/tune/{}"), HTTP_GET, handleTune);
     server.on("/rf/send", HTTP_GET, handleSendPing);
     server.on("/rf/read", HTTP_GET, handleReadPacket);
     server.on("/rf/rssi", HTTP_GET, handleRssi);
     server.on("/rf/sweep", HTTP_GET, handleSweep);
+    server.on("/rf/spectrum", HTTP_GET, handleSpectrum);
     server.on("/rf/monitor/on", HTTP_GET, handleMonitorOn);
     server.on("/rf/monitor/off", HTTP_GET, handleMonitorOff);
     server.on("/rf/carrier/on", HTTP_GET, handleCarrierOn);
